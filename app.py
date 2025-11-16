@@ -516,12 +516,23 @@ async def paper_qa(request: Request):
             text = extract_pdf_text_from_base64(pdf_content)
 
             # Build prompt with PDF content
-            prompt = f"""Answer the question based on the paper content.
+            prompt = f"""
+                You are a scientific reviewer. Answer the question based **only** on the content of the paper below. 
+                Provide a structured, detailed, and technically accurate response. 
+                
+                Paper:
+                {text}
+                
+                Question: {query}
+                
+                Instructions:
+                - Make sure your answer demonstrates **understanding** of the paper’s content.
+                - Go beyond mere restatement; provide reasoning, analysis, or critique (**depth**).
+                - Directly address the question (**relevance**).
+                - Only use information supported by the paper; do not hallucinate (**faithfulness**).
+                - Structure your answer clearly, using headings or numbered points if helpful (**clarity**).
+                """
 
-Paper:
-{text}
-
-Question: {query}"""
 
             # Call reasoning model with streaming
             stream = await client.chat.completions.create(
@@ -586,74 +597,93 @@ async def ideation(request: Request):
                 content={"error": "Bad Request", "message": "Query is required"}
             )
 
-        # Hardcoded reference ideas for testing embedding model
-        reference_ideas = [
-            "Using deep learning to predict protein folding structures",
-            "Applying transformer models to drug discovery and molecular design",
-            "Leveraging reinforcement learning for automated experiment design",
-            "Developing AI-powered literature review and knowledge synthesis tools",
-            "Creating neural networks for climate modeling and weather prediction",
-            "Using machine learning to analyze large-scale genomic datasets"
-        ]
-
         print(f"[ideation] Received query: {query}")
-        print(f"[ideation] Using {len(reference_ideas)} hardcoded reference ideas for embedding similarity")
-        print(f"[ideation] Using LLM model: {os.getenv('SCI_LLM_MODEL')}")
-        print(f"[ideation] Using embedding model: {os.getenv('SCI_EMBEDDING_MODEL')}")
+        print(f"[ideation] Using model: {os.getenv('SCI_LLM_MODEL')}")
 
         async def generate():
-            prompt = f"""Generate innovative research ideas for:
 
-{query}"""
+            queue = asyncio.Queue()
 
-            # Use embedding model to find similarities with hardcoded reference ideas
-            print("[ideation] Computing embeddings for similarity analysis...")
+            def sse_text(text: str):
+                return (
+                    "data: "
+                    + json.dumps({
+                        "object": "chat.completion.chunk",
+                        "choices": [{"delta": {"content": text}}]
+                    })
+                    + "\n\n"
+                )
 
-            # Get embedding for query
-            query_embedding = await get_embedding(query)
+            # --- 起始输出 ---
+            yield sse_text("Starting search and summary of relevant papers...It may take a few minutes.\n")
+        
+            async def progress_callback(msg: str):
+                await queue.put(msg)
 
-            # Get embeddings for reference ideas and compute similarities
-            similarities = []
-            for idx, idea in enumerate(reference_ideas):
-                idea_embedding = await get_embedding(idea)
-                similarity = cosine_similarity(query_embedding, idea_embedding)
-                similarities.append((idx, idea, similarity))
+            async def run_prompt_job():
+                prompt = await get_literature_review_prompt(query, progress_callback)
+                await queue.put("[FINAL_PROMPT]" + prompt)
+                await queue.put(None)   # 结束信号
 
-            # Sort by similarity (highest first)
-            similarities.sort(key=lambda x: x[2], reverse=True)
+            # 启动后台任务
+            asyncio.create_task(run_prompt_job())
 
-            # Add similarity analysis to prompt
-            prompt += f"\n\nReference ideas (ranked by similarity):\n"
-            for idx, idea, sim in similarities:
-                prompt += f"\n{idx+1}. (similarity: {sim:.3f}) {idea}"
+            # --- 主循环：从 queue 读消息并 SSE 输出 ---
+            while True:
+                msg = await queue.get()
+                if msg is None:
+                    break
+                
+                # 收到最终 prompt → 开始调用模型并流式返回
+                if msg.startswith("[FINAL_PROMPT]"):
+                    full_prompt = (
+                        "Conduct a literature review on the following topic: "
+                        + query
+                        + "\n"
+                        + msg[len("[FINAL_PROMPT]"):]
+                    )
 
-            prompt += "\n\nGenerate novel research ideas based on the above."
+                    stream = await client.chat.completions.create(
+                        model=os.getenv("SCI_LLM_MODEL"),
+                        messages=[{"role": "user", "content": full_prompt}],
+                        max_tokens=4096,
+                        temperature=0.2,
+                        stream=True
+                    )
+                    full_text = ""
+                    async for chunk in stream:
+                        if chunk.choices and len(chunk.choices) > 0:
+                            delta_content = chunk.choices[0].delta.content
+                            if delta_content:
+                                full_text += delta_content
 
-            # Call LLM model with streaming
-            stream = await client.chat.completions.create(
-                model=os.getenv("SCI_LLM_MODEL"),
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2048,
-                temperature=0.2,
-                stream=True
-            )
+                    new_prompt = (
+                        f"Based on the following literature review, please propose several novel and scientifically rigorous research ideas specifically on the topic: {query}.\n"
+                        f"{full_text}\n"
+                        "Do NOT repeat or summarize the review. Focus only on generating original, innovative ideas related to this topic. "
+                        "Each idea should clearly reference the topic, be feasible, grounded in current knowledge, and include: "
+                        "1) why it is novel, "
+                        "2) what methods or approaches could be used, and "
+                        "3) potential applications or impact. "
+                        "Provide approximately 1500 words, begin directly with a compelling title or opening sentence, "
+                        "and organize the ideas clearly, for example numbered or tiered by conceptual depth."
+                    )
+                    
+                    
+                    print(new_prompt)
+                    stream = await client.chat.completions.create(
+                        model=os.getenv("SCI_LLM_MODEL"),
+                        messages=[{"role": "user", "content": new_prompt}],
+                        max_tokens=4096,
+                        temperature=0.2,
+                        stream=True
+                    )
 
-            # Stream back results
-            async for chunk in stream:
-                if chunk.choices and len(chunk.choices) > 0:
-                    delta_content = chunk.choices[0].delta.content
-                    if delta_content:
-                        response_data = {
-                            "object": "chat.completion.chunk",
-                            "choices": [{
-                                "delta": {
-                                    "content": delta_content
-                                }
-                            }]
-                        }
-                        yield f"data: {json.dumps(response_data)}\n\n"
-
-            yield "data: [DONE]\n\n"
+                    async for chunk in stream:
+                        yield "data: " + json.dumps(chunk.model_dump()) + "\n\n"
+                else:
+                    # 普通进度消息
+                    yield sse_text(msg + "\n")
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -662,7 +692,6 @@ async def ideation(request: Request):
             status_code=500,
             content={"error": "Internal Server Error", "message": str(e)}
         )
-
 
 @app.post("/paper_review")
 async def paper_review(request: Request):
@@ -694,12 +723,35 @@ async def paper_review(request: Request):
             text = extract_pdf_text_from_base64(pdf_content)
 
             # Build prompt with PDF content
-            prompt = f"""Review the following paper:
+            prompt = f"""
+                You are an expert academic reviewer. 
+                Your task is to provide a **structured review** of the following paper. 
+                Do NOT summarize the text in a casual way—follow the exact format required by Paper Review:
 
-Paper:
-{text}
+                Paper:
+                {text}
 
-Instruction: {query}"""
+                Output format:
+
+                1. Summary: Provide a concise summary of the paper.
+                2. Strengths: List the key strengths and contributions.
+                3. Weaknesses / Concerns: List important weaknesses, limitations, or concerns.
+                4. Questions for Authors: List any clarifying questions or points that need author input.
+                5. Scores:
+                   - Overall (0-10): 
+                   - Novelty (0-10): 
+                   - Technical Quality (0-10): 
+                   - Clarity (0-10): 
+                   - Confidence (0-5): 
+
+                Instructions:
+                - Provide **professional, detailed, and specific feedback** for each section.
+                - Scores should be **consistent with your textual reasoning**.
+                - Be balanced: discuss both strengths and weaknesses fairly.
+                - Ensure clarity and readability, with well-structured, organized text.
+                - Do not include any personal opinions outside the context of reviewing the paper.
+                """
+
 
             # Call LLM model with streaming
             stream = await client.chat.completions.create(
