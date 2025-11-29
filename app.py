@@ -11,7 +11,7 @@ import httpx
 import PyPDF2
 from io import BytesIO
 import numpy as np
-
+import aiohttp
 # Load environment variables
 load_dotenv()
 
@@ -243,6 +243,26 @@ async def fetch_all_papers(keywords):
     return {kw: res for kw, res in zip(keywords, all_results)}
 
 
+async def summarize_single_paper_no_llm(paper):
+    """
+    不调用 LLM，直接返回摘要信息作为 summary。
+    """
+    title = paper.get("title", "N/A")
+    year = paper.get("publication_year", "N/A")
+    authors = ", ".join([a.get("author_name", "") for a in paper.get("authorships", [])]) \
+             if paper.get("authorships") else "N/A"
+    citations = paper.get("cited_by_count", 0)
+    abstract = paper.get("abstract", "") or "No abstract available."
+
+    # 直接用文章信息当 summary，确保兼容原结构
+    summary = (
+        f"Title: {title}\n"
+        f"Year: {year}\n"
+        f"Authors: {authors}\n"
+        f"Citations: {citations}\n"
+        f"Abstract Summary: {abstract}"
+    )
+    return summary
 async def summarize_single_paper_with_llm(paper):
     client = AsyncOpenAI(
         base_url=os.getenv("SCI_MODEL_BASE_URL"),
@@ -302,12 +322,16 @@ async def summarize_reference_papers(reference_papers: list):
 
 
         year = paper_info.get("publication_year") or paper_info.get("year") or "未知年份"
-
+        
+        doi = paper_info.get("doi")
+        openalex_id = paper_info.get("id")
+        link = doi if doi else openalex_id if openalex_id else "无链接"
         summaries[title] = {
             "title": paper_info.get("title", title),
             "author": paper_info.get("first_author", "未知作者"),
             "year": year,
-            "summary": summary_text
+            "summary": summary_text,
+            "link": link
         }
 
     return summaries
@@ -321,14 +345,18 @@ async def summarize_all_papers(paper_infos):
                 summary = await summarize_single_paper_with_llm(paper)
                 
                 year = paper.get("publication_year") or paper.get("year") or "未知年份"
-
+                doi = paper.get("doi")
+                openalex_id = paper.get("id")
+                link = doi if doi else openalex_id if openalex_id else "无链接"
                 summaries[kw][section].append({
                     "title": paper.get("title"),
                     "author": paper.get("first_author", "未知作者"),
                     "year": year,
-                    "summary": summary
+                    "summary": summary,
+                    "link": link
                 })
     return summaries
+
 def build_literature_review_prompt(
     keyword_summaries: dict,
     reference_summaries: dict = None
@@ -358,7 +386,25 @@ def build_literature_review_prompt(
                 f"   Summary: {paper['summary']}\n"
             )
         prompt += "\n"
+    References = "References:\n"
+    ref_index = 1
 
+    # Add references from keyword summaries
+    for kw, papers in keyword_summaries.items():
+        for section in ["most_cited", "most_relevant"]:
+            for paper in papers[section]:
+                References += (
+                    f"{ref_index}. {paper['author']} ({paper['year']}). {paper['title']}. {paper['link']}\n"
+                )
+                ref_index += 1
+
+    # Add references from recommendation list
+    if reference_summaries:
+        for title, paper in reference_summaries.items():
+            References += (
+                f"{ref_index}. {paper['author']} ({paper['year']}). {paper['title']}. {paper['link']}\n"
+            )
+            ref_index += 1
     prompt += (
         "Based on all the above papers, please generate a coherent, well-structured, and academically polished literature review. "
         "Organize the review using clear thematic structure, highlight major research threads, synthesize trends across papers, "
@@ -366,22 +412,29 @@ def build_literature_review_prompt(
         "Emphasize depth, accuracy, and conceptual clarity. "
         "Do not invent paper information; summarize and integrate only what is provided. "
         "Write with the tone and rigor of a top-tier conference survey. "
-        "Be approximately 1500 words long. "
+        "Be approximately 3500 words long. "
         "Begin directly with a strong title or opening sentence, with no meta-introduction or phrases such as 'Here is' or 'Below is'. "
         "Ensure the writing reads naturally, with smooth transitions and cohesive narrative flow."
     )
 
-    return prompt
+    return prompt,References
 
 async def get_literature_review_prompt(query: str, progress_callback):
-    await progress_callback("Extracting keywords...")
+    
+    await progress_callback("Step 1/6: Identifying core concepts and extracting domain-specific keywords...")
     keywords = await get_keywords_from_model(query)
-    await progress_callback("Fetching relevant papers...")
+    
+    await progress_callback("Step 2/6: Retrieving highly relevant papers based on semantic and citation signals...")
     paper_infos = await fetch_all_papers(keywords)
+
+    await progress_callback("Step 3/6: Collecting foundational and influential reference works for contextual grounding...")
     reference_papers = await get_reference_papers(query)
-    await progress_callback("Summarizing papers (part 1/2)...")
+
+    await progress_callback("Step 4/6: Synthesizing key insights from retrieved papers ...")
     summaries = await summarize_all_papers(paper_infos)
-    await progress_callback("Summarizing papers (part 2/2)...")
+
+    await progress_callback("Step 5/6: Integrating synthesized insights into a coherent, comprehensive literature understanding ...")
+
     reference_summaries = await summarize_reference_papers(reference_papers)
 
     prompt = build_literature_review_prompt(summaries, reference_summaries)
@@ -426,15 +479,14 @@ async def literature_review(request: Request):
                     + "\n\n"
                 )
 
-            # --- 起始输出 ---
-            yield sse_text("Starting search and summary of relevant papers...It may take a few minutes.\n")
         
             async def progress_callback(msg: str):
                 await queue.put(msg)
-
+        
             async def run_prompt_job():
-                prompt = await get_literature_review_prompt(query, progress_callback)
+                prompt, References = await get_literature_review_prompt(query, progress_callback)
                 await queue.put("[FINAL_PROMPT]" + prompt)
+                await queue.put("[REFERENCES]" + References)
                 await queue.put(None)   # 结束信号
 
             # 启动后台任务
@@ -456,20 +508,81 @@ async def literature_review(request: Request):
                     )
 
                     # 调用大模型（流式）
+                    # stream = await client.chat.completions.create(
+                    #     model=os.getenv("SCI_LLM_MODEL"),
+                    #     messages=[{"role": "user", "content": full_prompt}],
+                    #     max_tokens=4096,
+                    #     temperature=0.2,
+                    #     stream=True
+                    # )
+
+                    # async for chunk in stream:
+                    #     yield "data: " + json.dumps(chunk.model_dump()) + "\n\n"
+                    # yield sse_text("Generating review draft...\n")
+
+                    # yield sse_text("Generating literature review ...\n")
                     stream = await client.chat.completions.create(
                         model=os.getenv("SCI_LLM_MODEL"),
                         messages=[{"role": "user", "content": full_prompt}],
-                        max_tokens=4096,
+                        max_tokens=4096*2,
                         temperature=0.2,
                         stream=True
                     )
+                    full_text = ""
+                    async for chunk in stream:
+                        if chunk.choices and len(chunk.choices) > 0:
+                            delta_content = chunk.choices[0].delta.content
+                            if delta_content:
+                                full_text += delta_content
 
+                    new_prompt = (
+                        "You are a High-Score Academic Polisher. Your task is to transform the following text into a version that "
+                        "is significantly clearer, more coherent, more persuasive, and more academically polished—optimized for "
+                        "human reviewers who value strong structure, precise articulation, and professional scholarly presentation.\n\n"
+                        "Be approximately 3000 words long. "
+
+                        "Your improvements should:\n"
+                        "1) Strengthen logical flow, including explicit connections between ideas and a clear argumentative arc.\n"
+                        "2) Increase clarity, precision, and readability while preserving a formal, academic tone.\n"
+                        "3) Make claims sound more rigorous, well-supported, and confidently articulated.\n"
+                        "4) Enhance transitions and ensure a smooth progression of concepts.\n"
+                        "5) Remove redundancy, vague expressions, and awkward or informal phrasing.\n"
+                        "6) Preserve all original meaning—do NOT add new facts or modify the scientific content.\n"
+                        "7) Emphasize coherence, depth, and an impression of expertise that aligns with top-tier academic writing.\n"
+                        "8) **Where appropriate, restructure parts of the content using concise and well-formatted Markdown tables** "
+                        "to improve organization, highlight contrasts, summarize contributions, or clarify multi-part structures. "
+                        "These tables must not introduce new information—they should only reformat existing content.\n\n"
+
+                        "Do NOT introduce new content. Only polish, restructure, and clarify expression.\n"
+                        "Begin directly with the improved, high-score version.\n\n"
+                        "Here is the text:\n"
+                        f"{full_text}"
+                    )
+
+
+                    yield sse_text("Step 6/6: Polishing review draft...\n")
+                    stream = await client.chat.completions.create(
+                        model=os.getenv("SCI_LLM_MODEL"),
+                        messages=[{"role": "user", "content": new_prompt}],
+                        max_tokens=4096*2,
+                        temperature=0.2,
+                        stream=True
+                    )
+                    full_text = ""
                     async for chunk in stream:
                         yield "data: " + json.dumps(chunk.model_dump()) + "\n\n"
+                        if chunk.choices and len(chunk.choices) > 0:
+                            delta_content = chunk.choices[0].delta.content
+                            if delta_content:
+                                full_text += delta_content
 
                 else:
+                    if msg.startswith("[REFERENCES]"):
+                        references_text = msg[len("[REFERENCES]"):]
+                        yield sse_text("\n\n" + references_text + "\n")
+                    else:
                     # 普通进度消息
-                    yield sse_text(msg + "\n")
+                        yield sse_text(msg + "\n")
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -615,13 +728,14 @@ async def ideation(request: Request):
                 )
 
             # --- 起始输出 ---
-            yield sse_text("Starting search and summary of relevant papers...It may take a few minutes.\n")
+            # yield sse_text("Starting search and summary of relevant papers...It may take a few minutes.\n")
         
             async def progress_callback(msg: str):
-                await queue.put(msg)
+                # await queue.put(msg)
+                pass
 
             async def run_prompt_job():
-                prompt = await get_literature_review_prompt(query, progress_callback)
+                prompt, _ = await get_literature_review_prompt(query, progress_callback)
                 await queue.put("[FINAL_PROMPT]" + prompt)
                 await queue.put(None)   # 结束信号
 
@@ -658,17 +772,29 @@ async def ideation(request: Request):
                                 full_text += delta_content
 
                     new_prompt = (
-                        f"Based on the following literature review, please propose several novel and scientifically rigorous research ideas specifically on the topic: {query}.\n"
-                        f"{full_text}\n"
-                        "Do NOT repeat or summarize the review. Focus only on generating original, innovative ideas related to this topic. "
-                        "Each idea should clearly reference the topic, be feasible, grounded in current knowledge, and include: "
-                        "1) why it is novel, "
-                        "2) what methods or approaches could be used, and "
-                        "3) potential applications or impact. "
-                        "Provide approximately 1500 words, begin directly with a compelling title or opening sentence, "
-                        "and organize the ideas clearly, for example numbered or tiered by conceptual depth."
+                        f"You are an expert researcher tasked with proposing genuinely novel, high-impact research ideas "
+                        f"based strictly on the topic: {query}. Your ideas must go significantly beyond the literature review "
+                        f"provided below, using it only as background context rather than something to summarize or rephrase.\n\n"
+                        f"{full_text}\n\n"
+                        "Generate entirely new, original research directions that would be considered innovative by top-tier "
+                        "researchers. Do NOT summarize, repeat, or restate any part of the review.\n\n"
+                        "Your output should:\n"
+                        "• Focus exclusively on producing breakthrough research ideas related to the topic.\n"
+                        "• Be scientifically rigorous, technically feasible, and clearly grounded in current knowledge.\n"
+                        "• Show deep understanding by proposing ideas that are specific, actionable, and non-obvious.\n"
+                        "• For each idea, explicitly include:\n"
+                        "    1) What makes it novel compared to existing work,\n"
+                        "    2) A concrete methodological plan or possible technical approaches,\n"
+                        "    3) The potential scientific or practical impact.\n"
+                        "• Avoid surface-level insights—aim for conceptual depth and multi-step reasoning.\n"
+                        "• Deliver approximately 1500 words.\n"
+                        "• Begin immediately with a strong, compelling title.\n"
+                        "• Organize ideas clearly (e.g., numbered, categorized by conceptual difficulty, or arranged from foundational to ambitious).\n\n"
+                         "Begin directly with a strong title or opening sentence, with no meta-introduction or phrases such as 'Here is' or 'Below is'. "
+                        "Your goal is to deliver research ideas that a human evaluator would consider highly creative, "
+                        "substantive, and publication-worthy."
                     )
-                    
+
                     
                     print(new_prompt)
                     stream = await client.chat.completions.create(
